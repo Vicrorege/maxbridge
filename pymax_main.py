@@ -9,6 +9,7 @@ from typing import Any
 
 import aiohttp
 from aiogram import Bot, Dispatcher, types
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 from pymax import MaxClient, Message
@@ -53,8 +54,24 @@ class BridgeMaxClient(MaxClient):
 
 PHONE = os.getenv("PHONE")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY") or None
 FORWARD_TG_TO_MAX = os.getenv("FORWARD_TG_TO_MAX") == "true"
 CHATS_JSON = os.getenv("CHATS")
+
+
+def telegram_proxy_for_log(proxy: str) -> str:
+    """Скрывает user:password в URL прокси для логов."""
+    if "@" not in proxy:
+        return proxy
+    scheme, rest = proxy.split("://", 1) if "://" in proxy else ("", proxy)
+    credentials, host = rest.rsplit("@", 1)
+    if ":" in credentials:
+        user, _password = credentials.split(":", 1)
+        redacted = f"{user}:***"
+    else:
+        redacted = "***"
+    return f"{scheme}://{redacted}@{host}" if scheme else f"{redacted}@{host}"
+
 
 if not PHONE:
     raise RuntimeError("В .env не задан PHONE")
@@ -94,10 +111,22 @@ MAX_HEADERS = UserAgentPayload(
     timezone="Europe/Moscow",
 )
 
-client = BridgeMaxClient(phone=PHONE, work_dir="cache", headers=MAX_HEADERS, reconnect=True)
+# Max всегда напрямую (proxy=None). Telegram — через TELEGRAM_PROXY, если задан.
+client = BridgeMaxClient(
+    phone=PHONE,
+    work_dir="cache",
+    headers=MAX_HEADERS,
+    reconnect=True,
+    proxy=None,
+)
 client.logger.propagate = False
-telegram_bot = Bot(token=BOT_TOKEN)
+telegram_session = AiohttpSession(proxy=TELEGRAM_PROXY) if TELEGRAM_PROXY else AiohttpSession()
+telegram_bot = Bot(token=BOT_TOKEN, session=telegram_session)
 dp = Dispatcher()
+if TELEGRAM_PROXY:
+    logger.info("Telegram traffic via proxy: %s", telegram_proxy_for_log(TELEGRAM_PROXY))
+else:
+    logger.info("Telegram traffic: direct (TELEGRAM_PROXY not set)")
 
 
 def build_author_name(user: object | None, fallback: str = "MAX") -> str:
