@@ -1,0 +1,13 @@
+services:
+  maxbridge:
+    build: .
+    container_name: maxbridge
+    restart: unless-stopped
+    env_file: .env
+    # host — чтобы TELEGRAM_PROXY=socks5://127.0.0.1:... достучался до прокси на хосте
+    network_mode: host
+    volumes:
+      - ./cache:/app/cache
+    # для первой авторизации MAX (код / QR в терминале)
+    stdin_open: true
+    tty: true
