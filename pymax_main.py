@@ -132,10 +132,28 @@ else:
 def build_author_name(user: object | None, fallback: str = "MAX") -> str:
     names = getattr(user, "names", None) or []
     if names:
-        name = getattr(names[0], "name", None)
-        if name:
-            return str(name)
+        entry = names[0]
+        name = (getattr(entry, "name", None) or "").strip()
+        first = (getattr(entry, "first_name", None) or "").strip()
+        last = (getattr(entry, "last_name", None) or "").strip()
+        given = first or name
+        if given and last and last not in given:
+            return f"{given} {last}"
+        if given:
+            return given
+        if last:
+            return last
     return fallback
+
+
+def telegram_display_name(user: types.User | None, fallback: str = "Telegram") -> str:
+    if user is None:
+        return fallback
+    first = (user.first_name or "").strip()
+    last = (user.last_name or "").strip()
+    if first and last:
+        return f"{first} {last}"
+    return first or last or fallback
 
 
 def build_text(author: str, text: str | None) -> str:
@@ -381,10 +399,11 @@ async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
 
     member = await bot.get_chat_member(chat_id=message.chat.id, user_id=message.from_user.id)
     custom_title = getattr(member, "custom_title", None)
+    display_name = telegram_display_name(member.user or message.from_user)
     if custom_title:
-        signature = f"{member.user.first_name} ({custom_title})"
+        signature = f"{display_name} ({custom_title})"
     else:
-        signature = message.from_user.first_name
+        signature = display_name
 
     text = build_text(signature, message.text or message.caption)
 
