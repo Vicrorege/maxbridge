@@ -25,7 +25,19 @@ root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 root_logger.handlers.clear()
 root_handler = logging.StreamHandler()
-root_handler.setFormatter(ColoredFormatter())
+
+
+class BridgeFormatter(ColoredFormatter):
+    """ColoredFormatter из pymax отбрасывает traceback — возвращаем его."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        if record.exc_info:
+            return f"{message}\n{self.formatException(record.exc_info)}"
+        return message
+
+
+root_handler.setFormatter(BridgeFormatter())
 root_logger.addHandler(root_handler)
 logger = logging.getLogger("maxbridge")
 
@@ -174,15 +186,25 @@ async def author_name_from_sender(sender: int | None, fallback: str = "MAX") -> 
     return build_author_name(user, fallback)
 
 
-async def resolve_linked_message(message: Message) -> tuple[Message, int | None]:
-    current = message
-    source_chat_id = message.chat_id
+async def resolve_content_message(message: Message) -> tuple[Message, int]:
+    """Сообщение для пересылки: свои attaches важнее link; REPLY не разворачиваем."""
+    incoming_chat_id = message.chat_id
+    if incoming_chat_id is None:
+        raise RuntimeError("У MAX-сообщения нет chat_id")
 
+    if message.attaches:
+        return message, incoming_chat_id
+
+    current = message
+    source_chat_id = incoming_chat_id
     for _ in range(20):
-        if current.link is None or current.link.message is None:
+        link = current.link
+        if link is None or link.message is None:
             break
-        source_chat_id = current.link.chat_id or source_chat_id
-        current = current.link.message
+        if (link.type or "").upper() == "REPLY":
+            break
+        source_chat_id = link.chat_id or source_chat_id
+        current = link.message
 
     return current, source_chat_id
 
@@ -224,12 +246,65 @@ async def download_bytes(url: str, fallback_name: str) -> tuple[bytes, str]:
     raise RuntimeError("Не удалось скачать файл из MAX после 3 попыток")
 
 
+async def resolve_max_media_url(
+    *,
+    kind: str,
+    primary_chat_id: int,
+    primary_message_id: int | str,
+    media_id: int,
+    fallback_chat_id: int | None = None,
+    fallback_message_id: int | str | None = None,
+) -> Any:
+    """FILE/VIDEO download: сначала ids сообщения с вложением, затем ids входящего."""
+    attempts: list[tuple[int, int | str]] = [(primary_chat_id, primary_message_id)]
+    if (
+        fallback_chat_id is not None
+        and fallback_message_id is not None
+        and (fallback_chat_id, fallback_message_id) not in attempts
+    ):
+        attempts.append((fallback_chat_id, fallback_message_id))
+
+    last_error: BaseException | None = None
+    for chat_id, message_id in attempts:
+        try:
+            if kind == "file":
+                result = await client.get_file_by_id(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    file_id=media_id,
+                )
+            else:
+                result = await client.get_video_by_id(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    video_id=media_id,
+                )
+            if result is None:
+                raise RuntimeError(f"MAX не вернул ссылку на {kind} {media_id}")
+            return result
+        except Exception as error:
+            last_error = error
+            logger.warning(
+                "Не удалось получить %s_id=%s через chat_id=%s message_id=%s: %s",
+                kind,
+                media_id,
+                chat_id,
+                message_id,
+                error,
+            )
+
+    assert last_error is not None
+    raise last_error
+
+
 async def send_max_attachment_to_telegram(
     tg_id: int,
     max_chat_id: int,
     max_message: Message,
     attach: object,
     caption: str,
+    fallback_chat_id: int | None = None,
+    fallback_message_id: int | str | None = None,
 ) -> None:
     if isinstance(attach, PhotoAttach):
         photo_bytes, filename = await download_bytes(attach.base_url, "photo.jpg")
@@ -252,14 +327,14 @@ async def send_max_attachment_to_telegram(
         return
 
     if isinstance(attach, VideoAttach):
-        video = await client.get_video_by_id(
-            chat_id=max_chat_id,
-            message_id=max_message.id,
-            video_id=attach.video_id,
+        video = await resolve_max_media_url(
+            kind="video",
+            primary_chat_id=max_chat_id,
+            primary_message_id=max_message.id,
+            media_id=attach.video_id,
+            fallback_chat_id=fallback_chat_id,
+            fallback_message_id=fallback_message_id,
         )
-        if video is None:
-            raise RuntimeError(f"MAX не вернул ссылку на видео {attach.video_id}")
-
         video_bytes, filename = await download_bytes(video.url, "video.mp4")
         logger.info("Отправляю видео в Telegram: %s, %s байт", filename, len(video_bytes))
         await telegram_bot.send_video(
@@ -271,14 +346,14 @@ async def send_max_attachment_to_telegram(
         return
 
     if isinstance(attach, FileAttach):
-        file = await client.get_file_by_id(
-            chat_id=max_chat_id,
-            message_id=max_message.id,
-            file_id=attach.file_id,
+        file = await resolve_max_media_url(
+            kind="file",
+            primary_chat_id=max_chat_id,
+            primary_message_id=max_message.id,
+            media_id=attach.file_id,
+            fallback_chat_id=fallback_chat_id,
+            fallback_message_id=fallback_message_id,
         )
-        if file is None:
-            raise RuntimeError(f"MAX не вернул ссылку на файл {attach.file_id}")
-
         file_bytes, filename = await download_bytes(file.url, attach.name or "file")
         logger.info("Отправляю документ в Telegram: %s, %s байт", filename, len(file_bytes))
         await telegram_bot.send_document(
@@ -287,6 +362,9 @@ async def send_max_attachment_to_telegram(
             document=types.BufferedInputFile(file_bytes, filename=filename),
         )
         logger.info("Документ отправлен в Telegram: %s", filename)
+        return
+
+    logger.warning("Пропускаю неподдерживаемое вложение MAX: %r", attach)
 
 
 @client.on_message()
@@ -300,8 +378,7 @@ async def handle_max_message(message: Message) -> None:
         if tg_id is None:
             return
 
-        max_message, source_chat_id = await resolve_linked_message(message)
-        max_chat_id = source_chat_id or incoming_chat_id
+        max_message, max_chat_id = await resolve_content_message(message)
 
         author = await author_name_from_sender(message.sender)
         caption = build_caption(author, max_message.text)
@@ -314,6 +391,8 @@ async def handle_max_message(message: Message) -> None:
                     max_message=max_message,
                     attach=attach,
                     caption=caption,
+                    fallback_chat_id=incoming_chat_id,
+                    fallback_message_id=message.id,
                 )
             return
 
