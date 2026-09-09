@@ -3,13 +3,14 @@ import json
 import logging
 import os
 import tempfile
+import time
 from collections import OrderedDict
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import aiohttp
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
@@ -60,51 +61,55 @@ DOWNLOAD_HEADERS = {
     "Accept": "*/*",
 }
 
-
-class BridgeMaxClient(MaxClient):
-    async def _send_notification_response(self, chat_id: int, message_id: str) -> None:
-        logger.debug("Skip MAX message ACK: chat_id=%s message_id=%s", chat_id, message_id)
-
-    async def _handle_message_notifications(self, data: dict[str, Any]) -> None:
-        try:
-            await super()._handle_message_notifications(data)
-        except Exception:
-            logger.exception("PyMax не смог обработать входящее MAX-сообщение: %r", data)
-
-
-class BoundedDict(OrderedDict):
-    def __init__(self, maxsize: int = 10000, *args: Any, **kwargs: Any) -> None:
-        self.maxsize = maxsize
-        super().__init__(*args, **kwargs)
-
-    def __setitem__(self, key: Any, value: Any) -> None:
-        if key in self:
-            self.move_to_end(key)
-        super().__setitem__(key, value)
-        if len(self) > self.maxsize:
-            self.popitem(last=False)
-
-
 PHONE = os.getenv("PHONE")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_PROXY = os.getenv("TELEGRAM_PROXY") or None
-FORWARD_TG_TO_MAX = os.getenv("FORWARD_TG_TO_MAX", "true").lower() in ("true", "1", "yes")
+FORWARD_TG_TO_MAX = os.getenv("FORWARD_TG_TO_MAX", "false").lower() in ("true", "1", "yes")
 
-# Общий чат Telegram (куда летят все сообщения MAX)
-COMMON_TG_CHAT_RAW = (
+# Пути к файлам персистентности в кэше
+CACHE_DIR = Path("cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+COMMON_CHAT_FILE = CACHE_DIR / "common_chat_id.txt"
+EXCLUDED_CHATS_FILE = CACHE_DIR / "excluded_chats.json"
+
+# Общий чат Telegram
+COMMON_TG_CHAT_ENV_RAW = (
     os.getenv("COMMON_TG_CHAT")
     or os.getenv("TELEGRAM_CHAT_ID")
     or os.getenv("TG_CHAT_ID")
     or ""
 ).strip()
-COMMON_TG_CHAT: int | None = int(COMMON_TG_CHAT_RAW) if COMMON_TG_CHAT_RAW else None
+COMMON_TG_CHAT_ENV: int | None = int(COMMON_TG_CHAT_ENV_RAW) if COMMON_TG_CHAT_ENV_RAW else None
+
+
+def load_common_chat_id() -> int | None:
+    if COMMON_TG_CHAT_ENV is not None:
+        return COMMON_TG_CHAT_ENV
+    if COMMON_CHAT_FILE.exists():
+        try:
+            val = COMMON_CHAT_FILE.read_text(encoding="utf-8").strip()
+            if val:
+                return int(val)
+        except Exception as error:
+            logger.warning("Не удалось прочитать %s: %s", COMMON_CHAT_FILE, error)
+    return None
+
+
+def save_common_chat_id(chat_id: int) -> None:
+    try:
+        COMMON_CHAT_FILE.write_text(str(chat_id), encoding="utf-8")
+        logger.info("Сохранен общий чат Telegram: %s", chat_id)
+    except Exception as error:
+        logger.warning("Не удалось сохранить %s: %s", COMMON_CHAT_FILE, error)
+
+
+CURRENT_COMMON_TG_CHAT: int | None = load_common_chat_id()
 
 # Показывать ли префикс с названием чата [Название чата]
 SHOW_CHAT_TITLE = os.getenv("SHOW_CHAT_TITLE", "true").lower() in ("true", "1", "yes")
 
 # Исключения чатов MAX
 EXCLUDE_CHATS_RAW = os.getenv("EXCLUDE_CHATS") or os.getenv("EXCLUDE_MAX_CHATS") or os.getenv("IGNORED_CHATS")
-EXCLUDED_CHATS_FILE = Path("cache/excluded_chats.json")
 
 
 def parse_exclude_chats(raw: str | None) -> set[int]:
@@ -144,7 +149,6 @@ def load_persisted_exclusions() -> set[int]:
 
 def save_persisted_exclusions(exclusions: set[int]) -> None:
     try:
-        EXCLUDED_CHATS_FILE.parent.mkdir(parents=True, exist_ok=True)
         EXCLUDED_CHATS_FILE.write_text(
             json.dumps(list(exclusions), indent=2, ensure_ascii=False),
             encoding="utf-8",
@@ -179,15 +183,12 @@ if not BOT_TOKEN:
 def parse_chats(value: str | None) -> dict[int, int]:
     if not value:
         return {}
-
     try:
         raw_chats = json.loads(value)
     except json.JSONDecodeError as error:
         raise RuntimeError("В .env CHATS должен быть JSON-объектом") from error
-
     if not isinstance(raw_chats, dict):
         raise RuntimeError("В .env CHATS должен быть JSON-объектом")
-
     try:
         return {int(max_id): int(telegram_id) for max_id, telegram_id in raw_chats.items()}
     except (TypeError, ValueError) as error:
@@ -198,18 +199,83 @@ CHATS_JSON = os.getenv("CHATS")
 CHATS = parse_chats(CHATS_JSON)
 CHATS_TELEGRAM = {telegram_id: max_id for max_id, telegram_id in CHATS.items()}
 
-if not COMMON_TG_CHAT and not CHATS:
-    raise RuntimeError("В .env должен быть задан либо COMMON_TG_CHAT (для всех чатов), либо CHATS (1-в-1)")
+
+class BoundedDict(OrderedDict):
+    def __init__(self, maxsize: int = 10000, *args: Any, **kwargs: Any) -> None:
+        self.maxsize = maxsize
+        super().__init__(*args, **kwargs)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        if len(self) > self.maxsize:
+            self.popitem(last=False)
+
 
 # Кэши сопоставления сообщений для реплаев
-# (max_chat_id, max_msg_id) -> tg_msg_id
 MAX_TO_TG_MSG: BoundedDict = BoundedDict(maxsize=10000)
-# tg_msg_id -> (max_chat_id, max_msg_id)
 TG_TO_MAX_MSG: BoundedDict = BoundedDict(maxsize=10000)
 
 # Кэш названий чатов MAX и известных чатов
 CHAT_TITLE_CACHE: dict[int, str] = {}
 KNOWN_CHATS: dict[int, dict[str, Any]] = {}
+
+
+class BridgeMaxClient(MaxClient):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.last_session_alert: float = 0.0
+
+    async def _send_notification_response(self, chat_id: int, message_id: str) -> None:
+        logger.debug("Skip MAX message ACK: chat_id=%s message_id=%s", chat_id, message_id)
+
+    async def _handle_message_notifications(self, data: dict[str, Any]) -> None:
+        try:
+            await super()._handle_message_notifications(data)
+        except Exception:
+            logger.exception("PyMax не смог обработать входящее MAX-сообщение: %r", data)
+
+    async def alert_session_dropped(self, reason: str = "") -> None:
+        now = time.time()
+        # Защита от спама алертами (не чаще 1 раза в 5 минут)
+        if now - self.last_session_alert < 300:
+            return
+        self.last_session_alert = now
+        logger.error("Сессия MAX потеряна или требует повторной авторизации: %s", reason)
+
+        target_chat = CURRENT_COMMON_TG_CHAT or (list(CHATS.values())[0] if CHATS else None)
+        if target_chat:
+            alert_msg = (
+                "⚠️ <b>Внимание: Сессия MAX слетела или требует входа!</b>\n\n"
+                f"<i>Причина: {reason or 'Потеря соединения / недействительный токен'}</i>\n\n"
+                "🛠 <b>Как быстро переавторизоваться:</b>\n"
+                "1. Подключитесь к контейнеру на сервере:\n"
+                "   <code>docker attach maxbridge</code>\n"
+                "   <i>(введите код из SMS/приложения или подтвердите вход)</i>\n\n"
+                "2. Или перезапустите мост:\n"
+                "   <code>cd /root/maxbridge && docker compose restart maxbridge && docker attach maxbridge</code>"
+            )
+            try:
+                await telegram_bot.send_message(
+                    chat_id=target_chat,
+                    text=alert_msg,
+                    parse_mode="HTML",
+                )
+            except Exception as error:
+                logger.error("Не удалось отправить алерт о сессии в Telegram: %s", error)
+
+    async def _sync(self, user_agent: UserAgentPayload | None = None) -> None:
+        try:
+            await super()._sync(user_agent)
+        except Exception as error:
+            await self.alert_session_dropped(f"Ошибка синхронизации: {error}")
+            raise
+
+    async def _login(self) -> None:
+        await self.alert_session_dropped("Сессия не найдена или устарела. Требуется ввод кода подтверждения.")
+        await super()._login()
+
 
 MAX_HEADERS = UserAgentPayload(
     device_type="WEB",
@@ -220,7 +286,6 @@ MAX_HEADERS = UserAgentPayload(
     timezone="Europe/Moscow",
 )
 
-# Max всегда напрямую (proxy=None). Telegram — через TELEGRAM_PROXY, если задан.
 client = BridgeMaxClient(
     phone=PHONE,
     work_dir="cache",
@@ -238,12 +303,13 @@ if TELEGRAM_PROXY:
 else:
     logger.info("Telegram traffic: direct (TELEGRAM_PROXY not set)")
 
-if COMMON_TG_CHAT:
-    logger.info("Common Telegram chat mode active: %s", COMMON_TG_CHAT)
+logger.info("Forwarding TG -> MAX is strictly %s", "ENABLED" if FORWARD_TG_TO_MAX else "DISABLED")
+if CURRENT_COMMON_TG_CHAT:
+    logger.info("Current common Telegram chat: %s", CURRENT_COMMON_TG_CHAT)
 if CHATS:
     logger.info("1-to-1 mapped chats: %s", CHATS)
 if EXCLUDED_CHATS:
-    logger.info("Initial excluded MAX chats: %s", list(EXCLUDED_CHATS))
+    logger.info("Excluded MAX chats count: %d (%s)", len(EXCLUDED_CHATS), list(EXCLUDED_CHATS))
 
 
 def build_author_name(user: object | None, fallback: str = "MAX") -> str:
@@ -662,10 +728,11 @@ async def handle_max_message(message: Message) -> None:
         is_common_target = False
 
         if tg_id is None:
-            if COMMON_TG_CHAT is not None:
-                tg_id = COMMON_TG_CHAT
+            if CURRENT_COMMON_TG_CHAT is not None:
+                tg_id = CURRENT_COMMON_TG_CHAT
                 is_common_target = True
             else:
+                logger.debug("Нет целевого TG-чата для MAX-сообщения (CURRENT_COMMON_TG_CHAT не задан)")
                 return
 
         max_message, max_chat_id = await resolve_content_message(message)
@@ -726,77 +793,61 @@ async def handle_max_message(message: Message) -> None:
         logger.exception("Не удалось переслать сообщение из MAX в Telegram")
 
 
-async def telegram_file_bytes(bot: Bot, file_id: str) -> bytes:
-    telegram_file = await bot.get_file(file_id)
-    if telegram_file.file_path is None:
-        raise RuntimeError("Telegram не вернул путь к файлу")
-    buffer = await bot.download_file(telegram_file.file_path)
-    if buffer is None:
-        raise RuntimeError("Telegram не скачал файл")
-    return buffer.read()
-
-
-async def send_telegram_attachment_to_max(
-    bot: Bot,
-    max_id: int,
-    text: str,
-    message: types.Message,
-    reply_to: int | None = None,
-) -> bool:
-    if message.photo:
-        photo = message.photo[-1]
-        raw = await telegram_file_bytes(bot, photo.file_id)
-        await client.send_message(
-            chat_id=max_id,
-            text=text,
-            attachment=Photo(raw=raw, path="telegram_photo.jpg"),
-            reply_to=reply_to,
-            notify=True,
-        )
-        return True
-
-    if message.video:
-        raw = await telegram_file_bytes(bot, message.video.file_id)
-        await client.send_message(
-            chat_id=max_id,
-            text=text,
-            attachment=Video(raw=raw, path=message.video.file_name or "telegram_video.mp4"),
-            reply_to=reply_to,
-            notify=True,
-        )
-        return True
-
-    if message.document:
-        raw = await telegram_file_bytes(bot, message.document.file_id)
-        filename = message.document.file_name or "telegram_file"
-        upload_dir = Path(tempfile.gettempdir()) / "maxbridge_uploads"
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        upload_path = upload_dir / Path(filename).name
-        upload_path.write_bytes(raw)
+@dp.my_chat_member()
+async def handle_my_chat_member(update: types.ChatMemberUpdated) -> None:
+    """Автоматическая привязка общего чата при добавлении бота в группу/канал."""
+    global CURRENT_COMMON_TG_CHAT
+    logger.info(
+        "Статус бота обновлен: chat_id=%s title=%s status=%s",
+        update.chat.id,
+        update.chat.title,
+        update.new_chat_member.status,
+    )
+    if update.new_chat_member.status in ("member", "administrator"):
+        CURRENT_COMMON_TG_CHAT = update.chat.id
+        save_common_chat_id(update.chat.id)
         try:
-            await client.send_message(
-                chat_id=max_id,
-                text=text,
-                attachment=File(path=str(upload_path)),
-                reply_to=reply_to,
-                notify=True,
+            await telegram_bot.send_message(
+                chat_id=update.chat.id,
+                text=(
+                    f"✅ <b>MAX Bridge успешно привязан к этой группе!</b>\n\n"
+                    f"• ID чата: <code>{update.chat.id}</code>\n"
+                    f"• Все входящие сообщения из MAX будут пересылаться сюда.\n"
+                    f"• Пересылка в MAX: <b>{'ВКЛЮЧЕНА' if FORWARD_TG_TO_MAX else 'ОТКЛЮЧЕНА (безопасно)'}</b>\n\n"
+                    "Команды управления: /chats, /exclude &lt;id&gt;, /include &lt;id&gt;, /excluded"
+                ),
+                parse_mode="HTML",
             )
-        finally:
-            upload_path.unlink(missing_ok=True)
-        return True
-
-    return False
+        except Exception as error:
+            logger.warning("Не удалось отправить приветствие в привязанный чат: %s", error)
 
 
 @dp.message()
 async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
+    global CURRENT_COMMON_TG_CHAT
     text = (message.text or message.caption or "").strip()
+
+    # Автопривязка первого группового чата, если еще не настроен
+    if message.chat.type in ("group", "supergroup") and CURRENT_COMMON_TG_CHAT is None:
+        CURRENT_COMMON_TG_CHAT = message.chat.id
+        save_common_chat_id(message.chat.id)
+        logger.info("Автоматически привязан общий чат Telegram: %s (%s)", message.chat.id, message.chat.title)
 
     # Обработка команд бота в Telegram
     if text.startswith("/"):
         parts = text.split()
         cmd = parts[0].lower().split("@")[0]
         args = parts[1:]
+
+        if cmd in ("/bind", "/bind_here", "/set_group"):
+            CURRENT_COMMON_TG_CHAT = message.chat.id
+            save_common_chat_id(message.chat.id)
+            await message.reply(
+                f"✅ Этот чат <b>{message.chat.title or message.chat.full_name}</b> (<code>{message.chat.id}</code>) "
+                "установлен как основной общий чат для трансляции MAX.",
+                parse_mode="HTML",
+            )
+            return
 
         if cmd in ("/chats", "/list_chats"):
             if not KNOWN_CHATS:
@@ -857,64 +908,24 @@ async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
             return
 
         if cmd in ("/help", "/start"):
+            status_chat = f"<code>{CURRENT_COMMON_TG_CHAT}</code>" if CURRENT_COMMON_TG_CHAT else "<i>не привязан</i>"
             help_text = (
                 "🤖 <b>MAX ⇄ Telegram Bridge</b>\n\n"
+                f"• Текущий общий чат: {status_chat}\n"
+                f"• Пересылка в MAX: <b>{'ВКЛЮЧЕНА' if FORWARD_TG_TO_MAX else 'ОТКЛЮЧЕНА'}</b>\n\n"
                 "Команды управления:\n"
+                "• /bind — привязать текущую группу как общий чат\n"
                 "• /chats — список известных чатов MAX\n"
                 "• /exclude &lt;id&gt; — добавить чат MAX в исключения\n"
                 "• /include &lt;id&gt; — убрать чат из исключений\n"
-                "• /excluded — список исключенных чатов\n\n"
-                "<i>Чтобы отправить ответ в нужный чат MAX из общего чата TG, ответьте (reply) на сообщение.</i>"
+                "• /excluded — список исключенных чатов"
             )
             await message.reply(help_text, parse_mode="HTML")
             return
 
+    # ВАЖНО: Если пересылка в MAX выключена — никогда ничего не пересылаем!
     if not FORWARD_TG_TO_MAX:
         return
-
-    if message.from_user is None:
-        return
-
-    max_id: int | None = None
-    reply_to_max_id: int | None = None
-
-    if message.chat.id in CHATS_TELEGRAM:
-        max_id = CHATS_TELEGRAM[message.chat.id]
-        if message.reply_to_message and message.reply_to_message.message_id in TG_TO_MAX_MSG:
-            _, reply_to_max_id = TG_TO_MAX_MSG[message.reply_to_message.message_id]
-    elif COMMON_TG_CHAT is not None and message.chat.id == COMMON_TG_CHAT:
-        if message.reply_to_message and message.reply_to_message.message_id in TG_TO_MAX_MSG:
-            max_id, reply_to_max_id = TG_TO_MAX_MSG[message.reply_to_message.message_id]
-        else:
-            logger.info("Сообщение в общем TG-чате пропущено (не является reply на сообщение MAX)")
-            return
-
-    if max_id is None:
-        return
-
-    member = await bot.get_chat_member(chat_id=message.chat.id, user_id=message.from_user.id)
-    custom_title = getattr(member, "custom_title", None)
-    display_name = telegram_display_name(member.user or message.from_user)
-    if custom_title:
-        signature = f"{display_name} ({custom_title})"
-    else:
-        signature = display_name
-
-    formatted_text = build_text(signature, message.text or message.caption)
-
-    try:
-        sent_attachment = await send_telegram_attachment_to_max(
-            bot, max_id, formatted_text, message, reply_to=reply_to_max_id
-        )
-        if not sent_attachment:
-            await client.send_message(
-                chat_id=max_id,
-                text=formatted_text,
-                reply_to=reply_to_max_id,
-                notify=True,
-            )
-    except Exception:
-        logger.exception("Не удалось переслать сообщение из Telegram в MAX (max_id=%s)", max_id)
 
 
 async def main() -> None:
