@@ -688,15 +688,11 @@ async def send_max_attachment_to_telegram(
 @client.on_start
 async def handle_max_start() -> None:
     logger.info("MAX клиент успешно запущен и авторизован.")
-    try:
-        chats = await client.fetch_chats()
-        logger.info("Предзагружено %d чатов MAX", len(chats))
-        for c in chats:
-            if getattr(c, "id", None) and getattr(c, "title", None):
-                CHAT_TITLE_CACHE[c.id] = c.title.strip()
-                KNOWN_CHATS[c.id] = {"title": c.title.strip(), "id": c.id}
-    except Exception as error:
-        logger.warning("Не удалось предзагрузить чаты MAX при старте: %s", error)
+    for c in getattr(client, "chats", []):
+        if getattr(c, "id", None) and getattr(c, "title", None):
+            CHAT_TITLE_CACHE[c.id] = c.title.strip()
+            KNOWN_CHATS[c.id] = {"title": c.title.strip(), "id": c.id}
+    logger.info("Кэш чатов инициализирован: %d групп", len(KNOWN_CHATS))
 
 
 @client.on_chat_update
