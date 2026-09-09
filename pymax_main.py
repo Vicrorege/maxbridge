@@ -685,7 +685,7 @@ async def send_max_attachment_to_telegram(
     return None
 
 
-@client.on_start()
+@client.on_start
 async def handle_max_start() -> None:
     logger.info("MAX клиент успешно запущен и авторизован.")
     try:
@@ -699,7 +699,7 @@ async def handle_max_start() -> None:
         logger.warning("Не удалось предзагрузить чаты MAX при старте: %s", error)
 
 
-@client.on_chat_update()
+@client.on_chat_update
 async def handle_chat_update(chat: Any) -> None:
     if getattr(chat, "id", None) and getattr(chat, "title", None):
         CHAT_TITLE_CACHE[chat.id] = chat.title.strip()
