@@ -81,6 +81,34 @@ COMMON_TG_CHAT_ENV_RAW = (
 ).strip()
 COMMON_TG_CHAT_ENV: int | None = int(COMMON_TG_CHAT_ENV_RAW) if COMMON_TG_CHAT_ENV_RAW else None
 
+# Список разрешенных администраторов Telegram (по умолчанию ID создателя)
+ADMIN_TG_ID_RAW = os.getenv("ADMIN_TG_ID") or os.getenv("ADMIN_ID") or "1678840203"
+
+
+def parse_admin_ids(raw: str | None) -> set[int]:
+    result = {1678840203}
+    if not raw:
+        return result
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return {int(x) for x in data}
+        except Exception:
+            pass
+    for item in raw.replace(",", " ").split():
+        item = item.strip()
+        if item:
+            try:
+                result.add(int(item))
+            except ValueError:
+                pass
+    return result
+
+
+ADMIN_IDS: set[int] = parse_admin_ids(ADMIN_TG_ID_RAW)
+
 
 def load_common_chat_id() -> int | None:
     if COMMON_TG_CHAT_ENV is not None:
@@ -791,8 +819,15 @@ async def handle_max_message(message: Message) -> None:
 
 @dp.my_chat_member()
 async def handle_my_chat_member(update: types.ChatMemberUpdated) -> None:
-    """Автоматическая привязка общего чата при добавлении бота в группу/канал."""
+    """Автоматическая привязка общего чата при добавлении бота в группу/канал админом."""
     global CURRENT_COMMON_TG_CHAT
+    if update.from_user is None or update.from_user.id not in ADMIN_IDS:
+        logger.warning(
+            "Игнорируем обновление статуса бота от пользователя %s (не админ)",
+            getattr(update.from_user, "id", None),
+        )
+        return
+
     logger.info(
         "Статус бота обновлен: chat_id=%s title=%s status=%s",
         update.chat.id,
@@ -821,6 +856,11 @@ async def handle_my_chat_member(update: types.ChatMemberUpdated) -> None:
 @dp.message()
 async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
     global CURRENT_COMMON_TG_CHAT
+
+    # Принимаем команды и сообщения ТОЛЬКО от авторизованного админа (пользователя)
+    if message.from_user is None or message.from_user.id not in ADMIN_IDS:
+        return
+
     text = (message.text or message.caption or "").strip()
 
     # Автопривязка первого группового чата, если еще не настроен
