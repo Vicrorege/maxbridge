@@ -367,14 +367,25 @@ def telegram_display_name(user: types.User | None, fallback: str = "Telegram") -
     return first or last or fallback
 
 
-def build_text(author: str, text: str | None, chat_title: str | None = None) -> str:
+def build_text(
+    author: str,
+    text: str | None,
+    chat_title: str | None = None,
+    reply_quote: str | None = None,
+) -> str:
     text = (text or "").strip()
     prefix = f"[{chat_title}] " if chat_title else ""
-    return f"{prefix}{author}: {text}" if text else f"{prefix}{author}:"
+    quote = f" (↩️ {reply_quote})" if reply_quote else ""
+    return f"{prefix}{author}{quote}: {text}" if text else f"{prefix}{author}{quote}:"
 
 
-def build_caption(author: str, text: str | None, chat_title: str | None = None) -> str:
-    return build_text(author, text, chat_title)[:1024]
+def build_caption(
+    author: str,
+    text: str | None,
+    chat_title: str | None = None,
+    reply_quote: str | None = None,
+) -> str:
+    return build_text(author, text, chat_title, reply_quote)[:1024]
 
 
 async def author_name_from_sender(sender: int | None, fallback: str = "MAX") -> str:
@@ -768,21 +779,41 @@ async def handle_max_message(message: Message) -> None:
         show_title_prefix = SHOW_CHAT_TITLE and (is_common_target or len(CHATS) > 1)
         title_prefix = chat_title if show_title_prefix else None
 
-        caption = build_caption(author, max_message.text, title_prefix)
-
-        # Проверяем, является ли сообщение ответом (REPLY)
+        # Проверяем, является ли сообщение ответом (REPLY) или пересылкой
         reply_to_tg_msg_id: int | None = None
-        if message.link and (message.link.type or "").upper() == "REPLY":
-            replied_msg_id = message.link.message_id or (
-                message.link.message.id if message.link.message else None
-            )
-            if replied_msg_id is not None:
-                reply_to_tg_msg_id = MAX_TO_TG_MSG.get((incoming_chat_id, replied_msg_id))
-                if reply_to_tg_msg_id is None:
-                    try:
-                        reply_to_tg_msg_id = MAX_TO_TG_MSG.get((incoming_chat_id, int(replied_msg_id)))
-                    except (ValueError, TypeError):
-                        pass
+        reply_quote_info: str | None = None
+
+        if message.link:
+            link_type = (getattr(message.link, "type", None) or "").upper()
+            link_msg = getattr(message.link, "message", None)
+            replied_chat_id = getattr(message.link, "chat_id", None) or incoming_chat_id
+            replied_msg_id = getattr(link_msg, "id", None) if link_msg else getattr(message.link, "message_id", None)
+
+            if link_type == "REPLY":
+                if replied_msg_id is not None:
+                    reply_to_tg_msg_id = MAX_TO_TG_MSG.get((replied_chat_id, replied_msg_id))
+                    if reply_to_tg_msg_id is None:
+                        try:
+                            reply_to_tg_msg_id = MAX_TO_TG_MSG.get((replied_chat_id, int(replied_msg_id)))
+                        except (ValueError, TypeError):
+                            pass
+
+                # Если в TG нет сообщения для нативного reply, формируем понятную цитату
+                if reply_to_tg_msg_id is None and link_msg is not None:
+                    replied_author = await author_name_from_sender(getattr(link_msg, "sender", None))
+                    replied_text = (getattr(link_msg, "text", "") or "").strip()
+                    if replied_text:
+                        if len(replied_text) > 35:
+                            replied_text = f"{replied_text[:32]}..."
+                        reply_quote_info = f"в ответ {replied_author}: «{replied_text}»"
+                    else:
+                        reply_quote_info = f"в ответ {replied_author}"
+
+            elif link_type == "FORWARD" and link_msg is not None:
+                forward_author = await author_name_from_sender(getattr(link_msg, "sender", None))
+                reply_quote_info = f"переслано от {forward_author}"
+
+        caption = build_caption(author, max_message.text, title_prefix, reply_quote_info)
 
         if max_message.attaches:
             for attach in max_message.attaches:
@@ -801,7 +832,7 @@ async def handle_max_message(message: Message) -> None:
                     TG_TO_MAX_MSG[sent_msg.message_id] = (incoming_chat_id, message.id)
             return
 
-        text = build_text(author, max_message.text, title_prefix)
+        text = build_text(author, max_message.text, title_prefix, reply_quote_info)
         sent_msg = await send_to_telegram(
             tg_id=tg_id,
             text=text,
