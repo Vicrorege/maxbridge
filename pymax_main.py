@@ -724,6 +724,239 @@ async def send_max_attachment_to_telegram(
     return None
 
 
+async def prepare_visual_item(
+    attach: PhotoAttach | VideoAttach,
+    max_chat_id: int,
+    max_message: Message,
+    fallback_chat_id: int | None,
+    fallback_message_id: int | str | None,
+) -> tuple[str, bytes, str] | None:
+    try:
+        if isinstance(attach, PhotoAttach):
+            photo_bytes, filename = await download_bytes(attach.base_url, "photo.jpg")
+            return ("photo", photo_bytes, filename)
+        elif isinstance(attach, VideoAttach):
+            video = await resolve_max_media_url(
+                kind="video",
+                primary_chat_id=max_chat_id,
+                primary_message_id=max_message.id,
+                media_id=attach.video_id,
+                fallback_chat_id=fallback_chat_id,
+                fallback_message_id=fallback_message_id,
+            )
+            video_bytes, filename = await download_bytes(video.url, "video.mp4")
+            return ("video", video_bytes, filename)
+    except Exception as err:
+        logger.exception("Не удалось загрузить визуальное вложение MAX: %s", err)
+        return None
+    return None
+
+
+async def send_max_visual_media_group(
+    tg_id: int,
+    max_chat_id: int,
+    max_message: Message,
+    visual_attaches: list[PhotoAttach | VideoAttach],
+    caption: str,
+    fallback_chat_id: int | None = None,
+    fallback_message_id: int | str | None = None,
+    reply_to_tg_msg_id: int | None = None,
+) -> list[types.Message]:
+    tasks = [
+        prepare_visual_item(
+            attach=a,
+            max_chat_id=max_chat_id,
+            max_message=max_message,
+            fallback_chat_id=fallback_chat_id,
+            fallback_message_id=fallback_message_id,
+        )
+        for a in visual_attaches
+    ]
+    downloaded = await asyncio.gather(*tasks)
+    items = [item for item in downloaded if item is not None]
+
+    if not items:
+        return []
+
+    if len(items) == 1:
+        kind, data_bytes, filename = items[0]
+        buf = types.BufferedInputFile(data_bytes, filename=filename)
+        reply_params = types.ReplyParameters(message_id=reply_to_tg_msg_id) if reply_to_tg_msg_id else None
+        try:
+            if kind == "photo":
+                try:
+                    msg = await telegram_bot.send_photo(
+                        chat_id=tg_id, caption=caption, photo=buf, reply_parameters=reply_params
+                    )
+                except TelegramBadRequest:
+                    msg = await telegram_bot.send_document(
+                        chat_id=tg_id, caption=caption, document=buf, reply_parameters=reply_params
+                    )
+            else:
+                try:
+                    msg = await telegram_bot.send_video(
+                        chat_id=tg_id, caption=caption, video=buf, reply_parameters=reply_params
+                    )
+                except TelegramBadRequest:
+                    msg = await telegram_bot.send_document(
+                        chat_id=tg_id, caption=caption, document=buf, reply_parameters=reply_params
+                    )
+            return [msg]
+        except TelegramBadRequest as error:
+            if reply_params and ("not found" in str(error).lower()):
+                if kind == "photo":
+                    msg = await telegram_bot.send_photo(chat_id=tg_id, caption=caption, photo=buf)
+                else:
+                    msg = await telegram_bot.send_video(chat_id=tg_id, caption=caption, video=buf)
+                return [msg]
+            raise
+
+    sent_messages: list[types.Message] = []
+    chunk_size = 10
+    for chunk_idx in range(0, len(items), chunk_size):
+        chunk = items[chunk_idx : chunk_idx + chunk_size]
+        media_group: list[types.InputMediaPhoto | types.InputMediaVideo] = []
+        for idx, (kind, data_bytes, filename) in enumerate(chunk):
+            buf = types.BufferedInputFile(data_bytes, filename=filename)
+            item_caption = caption if (chunk_idx == 0 and idx == 0) else None
+            if kind == "photo":
+                media_group.append(types.InputMediaPhoto(media=buf, caption=item_caption))
+            else:
+                media_group.append(types.InputMediaVideo(media=buf, caption=item_caption))
+
+        reply_params = (
+            types.ReplyParameters(message_id=reply_to_tg_msg_id)
+            if (reply_to_tg_msg_id and chunk_idx == 0)
+            else None
+        )
+
+        try:
+            msgs = await telegram_bot.send_media_group(
+                chat_id=tg_id,
+                media=media_group,
+                reply_parameters=reply_params,
+            )
+            sent_messages.extend(msgs)
+        except TelegramBadRequest as error:
+            if reply_params and ("not found" in str(error).lower()):
+                msgs = await telegram_bot.send_media_group(chat_id=tg_id, media=media_group)
+                sent_messages.extend(msgs)
+            else:
+                logger.warning("Telegram отклонил send_media_group: %s. Отправляем по одному.", error)
+                for idx, (kind, data_bytes, filename) in enumerate(chunk):
+                    buf = types.BufferedInputFile(data_bytes, filename=filename)
+                    c = caption if (chunk_idx == 0 and idx == 0) else None
+                    if kind == "photo":
+                        m = await telegram_bot.send_photo(chat_id=tg_id, caption=c, photo=buf)
+                    else:
+                        m = await telegram_bot.send_video(chat_id=tg_id, caption=c, video=buf)
+                    sent_messages.append(m)
+
+    return sent_messages
+
+
+async def prepare_document_item(
+    attach: FileAttach,
+    max_chat_id: int,
+    max_message: Message,
+    fallback_chat_id: int | None,
+    fallback_message_id: int | str | None,
+) -> tuple[bytes, str] | None:
+    try:
+        file = await resolve_max_media_url(
+            kind="file",
+            primary_chat_id=max_chat_id,
+            primary_message_id=max_message.id,
+            media_id=attach.file_id,
+            fallback_chat_id=fallback_chat_id,
+            fallback_message_id=fallback_message_id,
+        )
+        file_bytes, filename = await download_bytes(file.url, attach.name or "file")
+        return (file_bytes, filename)
+    except Exception as err:
+        logger.exception("Не удалось загрузить документ MAX: %s", err)
+        return None
+
+
+async def send_max_document_media_group(
+    tg_id: int,
+    max_chat_id: int,
+    max_message: Message,
+    file_attaches: list[FileAttach],
+    caption: str,
+    fallback_chat_id: int | None = None,
+    fallback_message_id: int | str | None = None,
+    reply_to_tg_msg_id: int | None = None,
+) -> list[types.Message]:
+    tasks = [
+        prepare_document_item(
+            attach=a,
+            max_chat_id=max_chat_id,
+            max_message=max_message,
+            fallback_chat_id=fallback_chat_id,
+            fallback_message_id=fallback_message_id,
+        )
+        for a in file_attaches
+    ]
+    downloaded = await asyncio.gather(*tasks)
+    items = [item for item in downloaded if item is not None]
+
+    if not items:
+        return []
+
+    if len(items) == 1:
+        data_bytes, filename = items[0]
+        buf = types.BufferedInputFile(data_bytes, filename=filename)
+        reply_params = types.ReplyParameters(message_id=reply_to_tg_msg_id) if reply_to_tg_msg_id else None
+        try:
+            msg = await telegram_bot.send_document(
+                chat_id=tg_id, caption=caption, document=buf, reply_parameters=reply_params
+            )
+            return [msg]
+        except TelegramBadRequest as error:
+            if reply_params and ("not found" in str(error).lower()):
+                msg = await telegram_bot.send_document(chat_id=tg_id, caption=caption, document=buf)
+                return [msg]
+            raise
+
+    sent_messages: list[types.Message] = []
+    chunk_size = 10
+    for chunk_idx in range(0, len(items), chunk_size):
+        chunk = items[chunk_idx : chunk_idx + chunk_size]
+        media_group: list[types.InputMediaDocument] = []
+        for idx, (data_bytes, filename) in enumerate(chunk):
+            buf = types.BufferedInputFile(data_bytes, filename=filename)
+            item_caption = caption if (chunk_idx == 0 and idx == 0) else None
+            media_group.append(types.InputMediaDocument(media=buf, caption=item_caption))
+
+        reply_params = (
+            types.ReplyParameters(message_id=reply_to_tg_msg_id)
+            if (reply_to_tg_msg_id and chunk_idx == 0)
+            else None
+        )
+
+        try:
+            msgs = await telegram_bot.send_media_group(
+                chat_id=tg_id,
+                media=media_group,
+                reply_parameters=reply_params,
+            )
+            sent_messages.extend(msgs)
+        except TelegramBadRequest as error:
+            if reply_params and ("not found" in str(error).lower()):
+                msgs = await telegram_bot.send_media_group(chat_id=tg_id, media=media_group)
+                sent_messages.extend(msgs)
+            else:
+                logger.warning("Telegram отклонил send_media_group для документов: %s. Отправляем по одному.", error)
+                for idx, (data_bytes, filename) in enumerate(chunk):
+                    buf = types.BufferedInputFile(data_bytes, filename=filename)
+                    c = caption if (chunk_idx == 0 and idx == 0) else None
+                    m = await telegram_bot.send_document(chat_id=tg_id, caption=c, document=buf)
+                    sent_messages.append(m)
+
+    return sent_messages
+
+
 @client.on_start
 async def handle_max_start() -> None:
     logger.info("MAX клиент успешно запущен и авторизован.")
@@ -816,21 +1049,103 @@ async def handle_max_message(message: Message) -> None:
         caption = build_caption(author, max_message.text, title_prefix, reply_quote_info)
 
         if max_message.attaches:
-            for attach in max_message.attaches:
-                sent_msg = await send_max_attachment_to_telegram(
+            visual_attaches = [
+                a for a in max_message.attaches if isinstance(a, (PhotoAttach, VideoAttach))
+            ]
+            file_attaches = [a for a in max_message.attaches if isinstance(a, FileAttach)]
+            other_attaches = [
+                a
+                for a in max_message.attaches
+                if not isinstance(a, (PhotoAttach, VideoAttach, FileAttach))
+            ]
+
+            sent_any = False
+
+            # 1. Визуальные вложения (фото / видео): группируем в альбом Telegram
+            if len(visual_attaches) >= 2:
+                sent_msgs = await send_max_visual_media_group(
                     tg_id=tg_id,
                     max_chat_id=max_chat_id,
                     max_message=max_message,
-                    attach=attach,
+                    visual_attaches=visual_attaches,
                     caption=caption,
                     fallback_chat_id=incoming_chat_id,
                     fallback_message_id=message.id,
                     reply_to_tg_msg_id=reply_to_tg_msg_id,
                 )
-                if sent_msg is not None:
-                    MAX_TO_TG_MSG[(incoming_chat_id, message.id)] = sent_msg.message_id
-                    TG_TO_MAX_MSG[sent_msg.message_id] = (incoming_chat_id, message.id)
-            return
+                for sm in sent_msgs:
+                    MAX_TO_TG_MSG[(incoming_chat_id, message.id)] = sm.message_id
+                    TG_TO_MAX_MSG[sm.message_id] = (incoming_chat_id, message.id)
+                sent_any = bool(sent_msgs)
+            elif len(visual_attaches) == 1:
+                sm = await send_max_attachment_to_telegram(
+                    tg_id=tg_id,
+                    max_chat_id=max_chat_id,
+                    max_message=max_message,
+                    attach=visual_attaches[0],
+                    caption=caption,
+                    fallback_chat_id=incoming_chat_id,
+                    fallback_message_id=message.id,
+                    reply_to_tg_msg_id=reply_to_tg_msg_id,
+                )
+                if sm is not None:
+                    MAX_TO_TG_MSG[(incoming_chat_id, message.id)] = sm.message_id
+                    TG_TO_MAX_MSG[sm.message_id] = (incoming_chat_id, message.id)
+                    sent_any = True
+
+            # 2. Файлы / документы
+            doc_caption = caption if not sent_any else ""
+            if len(file_attaches) >= 2 and not sent_any:
+                sent_msgs = await send_max_document_media_group(
+                    tg_id=tg_id,
+                    max_chat_id=max_chat_id,
+                    max_message=max_message,
+                    file_attaches=file_attaches,
+                    caption=doc_caption,
+                    fallback_chat_id=incoming_chat_id,
+                    fallback_message_id=message.id,
+                    reply_to_tg_msg_id=reply_to_tg_msg_id if not sent_any else None,
+                )
+                for sm in sent_msgs:
+                    MAX_TO_TG_MSG[(incoming_chat_id, message.id)] = sm.message_id
+                    TG_TO_MAX_MSG[sm.message_id] = (incoming_chat_id, message.id)
+                sent_any = sent_any or bool(sent_msgs)
+            else:
+                for fa in file_attaches:
+                    sm = await send_max_attachment_to_telegram(
+                        tg_id=tg_id,
+                        max_chat_id=max_chat_id,
+                        max_message=max_message,
+                        attach=fa,
+                        caption=doc_caption if not sent_any else "",
+                        fallback_chat_id=incoming_chat_id,
+                        fallback_message_id=message.id,
+                        reply_to_tg_msg_id=reply_to_tg_msg_id if not sent_any else None,
+                    )
+                    if sm is not None:
+                        MAX_TO_TG_MSG[(incoming_chat_id, message.id)] = sm.message_id
+                        TG_TO_MAX_MSG[sm.message_id] = (incoming_chat_id, message.id)
+                        sent_any = True
+
+            # 3. Прочие вложения (голосовые, стикеры, контакты)
+            for oa in other_attaches:
+                sm = await send_max_attachment_to_telegram(
+                    tg_id=tg_id,
+                    max_chat_id=max_chat_id,
+                    max_message=max_message,
+                    attach=oa,
+                    caption=caption if not sent_any else "",
+                    fallback_chat_id=incoming_chat_id,
+                    fallback_message_id=message.id,
+                    reply_to_tg_msg_id=reply_to_tg_msg_id if not sent_any else None,
+                )
+                if sm is not None:
+                    MAX_TO_TG_MSG[(incoming_chat_id, message.id)] = sm.message_id
+                    TG_TO_MAX_MSG[sm.message_id] = (incoming_chat_id, message.id)
+                    sent_any = True
+
+            if sent_any:
+                return
 
         text = build_text(author, max_message.text, title_prefix, reply_quote_info)
         sent_msg = await send_to_telegram(
