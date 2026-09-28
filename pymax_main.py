@@ -264,6 +264,22 @@ class BridgeMaxClient(MaxClient):
         except Exception:
             logger.exception("PyMax не смог обработать входящее MAX-сообщение: %r", data)
 
+    async def connect(self, user_agent: UserAgentPayload | None = None) -> dict[str, Any] | None:
+        retry_delay = 1.0
+        while not self._stop_event.is_set():
+            try:
+                return await super().connect(user_agent)
+            except Exception as e:
+                logger.warning(
+                    "Ошибка подключения/handshake к MAX WebSocket (%s). Повтор через %.1f сек...",
+                    e,
+                    retry_delay,
+                )
+                await self._cleanup_client()
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 1.5, 30.0)
+        return None
+
     async def alert_session_dropped(self, reason: str = "") -> None:
         now = time.time()
         # Защита от спама алертами (не чаще 1 раза в 5 минут)
