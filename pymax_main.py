@@ -109,6 +109,8 @@ def parse_admin_ids(raw: str | None) -> set[int]:
 
 
 ADMIN_IDS: set[int] = parse_admin_ids(ADMIN_TG_ID_RAW)
+MAX_PASSWORD_ENV = os.getenv("MAX_PASSWORD") or os.getenv("PASSWORD") or None
+PASSWORD_FUTURE: asyncio.Future[str] | None = None
 
 
 def load_common_chat_id() -> int | None:
@@ -429,6 +431,101 @@ class BridgeMaxClient(MaxClient):
                 )
             except Exception:
                 pass
+
+    async def _two_factor_auth(self, password_challenge: dict[str, Any]) -> str:
+        global PASSWORD_FUTURE
+        self.logger.info("Starting two-factor authentication flow")
+
+        track_id = password_challenge.get("trackId")
+        if not track_id:
+            self.logger.critical("Password challenge missing track ID")
+            raise ValueError("Password challenge missing track ID")
+
+        hint = password_challenge.get("hint") or "Без подсказки"
+
+        if MAX_PASSWORD_ENV:
+            self.logger.info("Пробуем 2FA пароль из переменной окружения...")
+            token_attrs = await self._check_password(MAX_PASSWORD_ENV, track_id)
+            if token_attrs:
+                login_attrs = token_attrs.get("LOGIN", {})
+                token = login_attrs.get("token")
+                if token:
+                    self.logger.info("2FA пароль из .env успешно подошел!")
+                    return token
+                self.logger.warning("Пароль из .env подошел, но токен не найден в LOGIN")
+
+        prompt_text = (
+            "🔐 <b>Вход по QR-коду подтвержден!</b>\n\n"
+            f"Для аккаунта MAX требуется 2FA облачный пароль.\n"
+            f"Подсказка: <code>{hint}</code>\n\n"
+            "Отправьте пароль боту прямо в этот чат или в ЛС командой:\n"
+            "<code>/password ваш_пароль</code>\n\n"
+            "<i>(сообщение с паролем будет сразу удалено ботом для безопасности)</i>\n"
+            "или введите в терминале сервера: <code>docker attach maxbridge</code>"
+        )
+        target_chats = set()
+        if CURRENT_COMMON_TG_CHAT:
+            target_chats.add(CURRENT_COMMON_TG_CHAT)
+        for aid in ADMIN_IDS:
+            target_chats.add(aid)
+        for cid in target_chats:
+            try:
+                await telegram_bot.send_message(chat_id=cid, text=prompt_text, parse_mode="HTML")
+            except Exception as err:
+                logger.warning("Не удалось отправить запрос пароля в чат %s: %s", cid, err)
+
+        while True:
+            loop = asyncio.get_running_loop()
+            PASSWORD_FUTURE = loop.create_future()
+            stdin_task = asyncio.create_task(
+                asyncio.to_thread(lambda: input(f"Введите пароль (Подсказка: {hint}): ").strip())
+            )
+
+            done, pending = await asyncio.wait(
+                [PASSWORD_FUTURE, stdin_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            password = None
+            if PASSWORD_FUTURE in done and not PASSWORD_FUTURE.cancelled():
+                try:
+                    password = PASSWORD_FUTURE.result()
+                except Exception:
+                    pass
+            elif stdin_task in done:
+                try:
+                    password = stdin_task.result()
+                except Exception:
+                    pass
+
+            for t in pending:
+                t.cancel()
+
+            PASSWORD_FUTURE = None
+
+            if not password:
+                continue
+
+            self.logger.info("Проверяем введенный 2FA пароль...")
+            token_attrs = await self._check_password(password, track_id)
+            if not token_attrs:
+                self.logger.error("Неверный 2FA пароль")
+                for cid in target_chats:
+                    try:
+                        await telegram_bot.send_message(
+                            chat_id=cid,
+                            text="❌ <b>Неверный пароль MAX.</b> Попробуйте еще раз: <code>/password ваш_пароль</code>",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
+                continue
+
+            login_attrs = token_attrs.get("LOGIN", {})
+            token = login_attrs.get("token")
+            if not token:
+                raise ValueError("В ответе авторизации отсутствует tokenAttrs.LOGIN.token")
+            return token
 
 
 MAX_HEADERS = UserAgentPayload(
@@ -1453,6 +1550,24 @@ async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
                     pass
             return
 
+        if cmd == "/password":
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+            if not args:
+                await message.reply("Использование: <code>/password &lt;пароль_max&gt;</code>", parse_mode="HTML")
+                return
+
+            pwd = " ".join(args).strip()
+            if PASSWORD_FUTURE and not PASSWORD_FUTURE.done():
+                PASSWORD_FUTURE.set_result(pwd)
+                await message.reply("🔑 Пароль принят, проверяю...", parse_mode="HTML")
+            else:
+                await message.reply("В данный момент ввод 2FA пароля не требуется.", parse_mode="HTML")
+            return
+
         if cmd in ("/help", "/start"):
             status_chat = f"<code>{CURRENT_COMMON_TG_CHAT}</code>" if CURRENT_COMMON_TG_CHAT else "<i>не привязан</i>"
             help_text = (
@@ -1462,6 +1577,7 @@ async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
                 "Команды управления:\n"
                 "• /bind — привязать текущую группу как общий чат\n"
                 "• /qr — получить свежий QR-код для авторизации в MAX\n"
+                "• /password &lt;pwd&gt; — отправить 2FA облачный пароль MAX\n"
                 "• /relogin — принудительно сбросить сессию и войти заново\n"
                 "• /chats — список известных чатов MAX\n"
                 "• /exclude &lt;id&gt; — добавить чат MAX в исключения\n"
