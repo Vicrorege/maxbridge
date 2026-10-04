@@ -1557,15 +1557,27 @@ async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
                 pass
 
             if not args:
-                await message.reply("Использование: <code>/password &lt;пароль_max&gt;</code>", parse_mode="HTML")
+                await bot.send_message(
+                    chat_id=message.chat.id,
+                    text="Использование: <code>/password &lt;пароль_max&gt;</code>",
+                    parse_mode="HTML",
+                )
                 return
 
             pwd = " ".join(args).strip()
             if PASSWORD_FUTURE and not PASSWORD_FUTURE.done():
                 PASSWORD_FUTURE.set_result(pwd)
-                await message.reply("🔑 Пароль принят, проверяю...", parse_mode="HTML")
+                await bot.send_message(
+                    chat_id=message.chat.id,
+                    text="🔑 Пароль принят, проверяю...",
+                    parse_mode="HTML",
+                )
             else:
-                await message.reply("В данный момент ввод 2FA пароля не требуется.", parse_mode="HTML")
+                await bot.send_message(
+                    chat_id=message.chat.id,
+                    text="В данный момент ввод 2FA пароля не требуется.",
+                    parse_mode="HTML",
+                )
             return
 
         if cmd in ("/help", "/start"):
