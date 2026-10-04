@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+import qrcode
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest
@@ -254,6 +255,9 @@ class BridgeMaxClient(MaxClient):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.last_session_alert: float = 0.0
+        self.qr_attempts: int = 0
+        self.max_qr_attempts: int = 3
+        self.last_qr_link: str | None = None
 
     async def _send_notification_response(self, chat_id: int, message_id: str) -> None:
         logger.debug("Skip MAX message ACK: chat_id=%s message_id=%s", chat_id, message_id)
@@ -280,6 +284,75 @@ class BridgeMaxClient(MaxClient):
                 retry_delay = min(retry_delay * 1.5, 30.0)
         return None
 
+    def _print_qr(self, qr_link: str) -> None:
+        try:
+            super()._print_qr(qr_link)
+        except Exception:
+            pass
+        self.last_qr_link = qr_link
+        asyncio.create_task(self.send_qr_to_telegram(qr_link))
+
+    async def send_qr_to_telegram(self, qr_link: str) -> None:
+        self.qr_attempts += 1
+        target_chats = set()
+        if CURRENT_COMMON_TG_CHAT:
+            target_chats.add(CURRENT_COMMON_TG_CHAT)
+        for aid in ADMIN_IDS:
+            target_chats.add(aid)
+
+        if not target_chats:
+            logger.warning("Нет целевых Telegram-чатов для отправки QR-кода")
+            return
+
+        if self.qr_attempts > self.max_qr_attempts:
+            if self.qr_attempts == self.max_qr_attempts + 1:
+                logger.info("Превышен лимит автоматических попыток отправки QR-кода.")
+                for cid in target_chats:
+                    try:
+                        await telegram_bot.send_message(
+                            chat_id=cid,
+                            text=(
+                                "⏳ <b>Ожидание входа в MAX:</b> автоматическое обновление QR-кода приостановлено.\n\n"
+                                "Когда будете готовы отсканировать, отправьте команду <code>/qr</code> для получения свежего QR-кода."
+                            ),
+                            parse_mode="HTML",
+                        )
+                    except Exception as err:
+                        logger.warning("Не удалось отправить уведомление о паузе QR: %s", err)
+            return
+
+        try:
+            qr = qrcode.QRCode(box_size=10, border=2)
+            qr.add_data(qr_link)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            bio = BytesIO()
+            img.save(bio, format="PNG")
+            photo_bytes = bio.getvalue()
+
+            caption = (
+                "📲 <b>Вход в MAX по QR-коду</b>\n\n"
+                "1. Отсканируйте этот QR-код в мобильном приложении MAX:\n"
+                "   <b>Настройки ➔ Устройства ➔ Привязать устройство</b> (или камерой телефона)\n\n"
+                f"2. Или откройте ссылку:\n"
+                f"   <a href=\"{qr_link}\">{qr_link}</a>\n\n"
+                f"<i>⏱ Попытка {self.qr_attempts}/{self.max_qr_attempts}. QR-код действует ~2 мин.</i>"
+            )
+
+            for cid in target_chats:
+                try:
+                    await telegram_bot.send_photo(
+                        chat_id=cid,
+                        photo=types.BufferedInputFile(photo_bytes, filename="max_qr.png"),
+                        caption=caption,
+                        parse_mode="HTML",
+                    )
+                    logger.info("QR-код для входа в MAX отправлен в Telegram-чат %s", cid)
+                except Exception as err:
+                    logger.warning("Не удалось отправить QR-код в чат %s: %s", cid, err)
+        except Exception:
+            logger.exception("Ошибка при генерации/отправке QR-кода MAX")
+
     async def alert_session_dropped(self, reason: str = "") -> None:
         now = time.time()
         # Защита от спама алертами (не чаще 1 раза в 5 минут)
@@ -293,12 +366,7 @@ class BridgeMaxClient(MaxClient):
             alert_msg = (
                 "⚠️ <b>Внимание: Сессия MAX слетела или требует входа!</b>\n\n"
                 f"<i>Причина: {reason or 'Потеря соединения / недействительный токен'}</i>\n\n"
-                "🛠 <b>Как быстро переавторизоваться:</b>\n"
-                "1. Подключитесь к контейнеру на сервере:\n"
-                "   <code>docker attach maxbridge</code>\n"
-                "   <i>(введите код из SMS/приложения или подтвердите вход)</i>\n\n"
-                "2. Или перезапустите мост:\n"
-                "   <code>cd /root/maxbridge && docker compose restart maxbridge && docker attach maxbridge</code>"
+                "🔄 Запрашиваю QR-код для быстрого повторного входа..."
             )
             try:
                 await telegram_bot.send_message(
@@ -312,13 +380,55 @@ class BridgeMaxClient(MaxClient):
     async def _sync(self, user_agent: UserAgentPayload | None = None) -> None:
         try:
             await super()._sync(user_agent)
+            self.qr_attempts = 0
         except Exception as error:
+            err_str = str(error)
+            logger.warning("Ошибка синхронизации MAX: %s", err_str)
+            if any(k in err_str.lower() for k in ("fail_login_token", "login.token", "авторизируйтесь", "invalid_token")):
+                logger.error("Сессия MAX недействительна (FAIL_LOGIN_TOKEN). Сбрасываем токен в памяти и базе...")
+                self._token = None
+                try:
+                    from pymax.models import Auth
+                    from sqlmodel import select
+                    with self._database.get_session() as session:
+                        auth = session.exec(select(Auth)).first()
+                        if auth:
+                            auth.token = None
+                            session.add(auth)
+                            session.commit()
+                except Exception as db_err:
+                    logger.warning("Не удалось сбросить токен в session.db: %s", db_err)
+
             await self.alert_session_dropped(f"Ошибка синхронизации: {error}")
             raise
 
     async def _login(self) -> None:
-        await self.alert_session_dropped("Сессия не найдена или устарела. Требуется ввод кода подтверждения.")
-        await super()._login()
+        logger.info("Запуск процедуры авторизации MAX (_login)...")
+        while self.qr_attempts > self.max_qr_attempts and not self._stop_event.is_set():
+            await asyncio.sleep(5)
+
+        try:
+            await super()._login()
+        except Exception as e:
+            logger.error("Ошибка в процессе _login: %s", e)
+            raise
+
+        logger.info("Авторизация MAX успешно завершена!")
+        self.qr_attempts = 0
+        target_chats = set()
+        if CURRENT_COMMON_TG_CHAT:
+            target_chats.add(CURRENT_COMMON_TG_CHAT)
+        for aid in ADMIN_IDS:
+            target_chats.add(aid)
+        for cid in target_chats:
+            try:
+                await telegram_bot.send_message(
+                    chat_id=cid,
+                    text="✅ <b>Авторизация в MAX успешно пройдена!</b> Мост снова в сети и пересылает сообщения.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
 
 
 MAX_HEADERS = UserAgentPayload(
@@ -1305,6 +1415,44 @@ async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
             await message.reply("\n".join(lines), parse_mode="HTML")
             return
 
+        if cmd in ("/qr", "/login", "/auth"):
+            if client._token is not None:
+                await message.reply(
+                    "ℹ️ Сессия MAX сейчас активна. Если хотите сбросить её и войти заново, отправьте <code>/relogin</code>.",
+                    parse_mode="HTML",
+                )
+            else:
+                client.qr_attempts = 0
+                await message.reply("🔄 Запрашиваю свежий QR-код для входа в MAX...", parse_mode="HTML")
+                if client._ws and not client._ws.closed:
+                    try:
+                        await client._ws.close()
+                    except Exception:
+                        pass
+            return
+
+        if cmd in ("/relogin", "/reset_auth"):
+            await message.reply("⚠️ Сбрасываю текущую сессию MAX и запрашиваю новый QR-код...", parse_mode="HTML")
+            client._token = None
+            client.qr_attempts = 0
+            try:
+                from pymax.models import Auth
+                from sqlmodel import select
+                with client._database.get_session() as session:
+                    auth = session.exec(select(Auth)).first()
+                    if auth:
+                        auth.token = None
+                        session.add(auth)
+                        session.commit()
+            except Exception as e:
+                logger.warning("Ошибка сброса токена: %s", e)
+            if client._ws and not client._ws.closed:
+                try:
+                    await client._ws.close()
+                except Exception:
+                    pass
+            return
+
         if cmd in ("/help", "/start"):
             status_chat = f"<code>{CURRENT_COMMON_TG_CHAT}</code>" if CURRENT_COMMON_TG_CHAT else "<i>не привязан</i>"
             help_text = (
@@ -1313,6 +1461,8 @@ async def handle_telegram_message(message: types.Message, bot: Bot) -> None:
                 f"• Пересылка в MAX: <b>{'ВКЛЮЧЕНА' if FORWARD_TG_TO_MAX else 'ОТКЛЮЧЕНА'}</b>\n\n"
                 "Команды управления:\n"
                 "• /bind — привязать текущую группу как общий чат\n"
+                "• /qr — получить свежий QR-код для авторизации в MAX\n"
+                "• /relogin — принудительно сбросить сессию и войти заново\n"
                 "• /chats — список известных чатов MAX\n"
                 "• /exclude &lt;id&gt; — добавить чат MAX в исключения\n"
                 "• /include &lt;id&gt; — убрать чат из исключений\n"
