@@ -15,7 +15,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
-from pymax import MaxClient, Message
+from pymax import MaxClient, Message, Opcode
 from pymax.files import File, Photo, Video
 from pymax.formatter import ColoredFormatter
 from pymax.payloads import UserAgentPayload
@@ -296,11 +296,8 @@ class BridgeMaxClient(MaxClient):
 
     async def send_qr_to_telegram(self, qr_link: str) -> None:
         self.qr_attempts += 1
-        target_chats = set()
-        if CURRENT_COMMON_TG_CHAT:
-            target_chats.add(CURRENT_COMMON_TG_CHAT)
-        for aid in ADMIN_IDS:
-            target_chats.add(aid)
+        # QR-код и данные авторизации отправляем строго в ЛС администратору
+        target_chats = set(ADMIN_IDS)
 
         if not target_chats:
             logger.warning("Нет целевых Telegram-чатов для отправки QR-кода")
@@ -417,11 +414,7 @@ class BridgeMaxClient(MaxClient):
 
         logger.info("Авторизация MAX успешно завершена!")
         self.qr_attempts = 0
-        target_chats = set()
-        if CURRENT_COMMON_TG_CHAT:
-            target_chats.add(CURRENT_COMMON_TG_CHAT)
-        for aid in ADMIN_IDS:
-            target_chats.add(aid)
+        target_chats = set(ADMIN_IDS)
         for cid in target_chats:
             try:
                 await telegram_bot.send_message(
@@ -458,16 +451,12 @@ class BridgeMaxClient(MaxClient):
             "🔐 <b>Вход по QR-коду подтвержден!</b>\n\n"
             f"Для аккаунта MAX требуется 2FA облачный пароль.\n"
             f"Подсказка: <code>{hint}</code>\n\n"
-            "Отправьте пароль боту прямо в этот чат или в ЛС командой:\n"
+            "Отправьте пароль боту в ЛС командой:\n"
             "<code>/password ваш_пароль</code>\n\n"
             "<i>(сообщение с паролем будет сразу удалено ботом для безопасности)</i>\n"
             "или введите в терминале сервера: <code>docker attach maxbridge</code>"
         )
-        target_chats = set()
-        if CURRENT_COMMON_TG_CHAT:
-            target_chats.add(CURRENT_COMMON_TG_CHAT)
-        for aid in ADMIN_IDS:
-            target_chats.add(aid)
+        target_chats = set(ADMIN_IDS)
         for cid in target_chats:
             try:
                 await telegram_bot.send_message(chat_id=cid, text=prompt_text, parse_mode="HTML")
