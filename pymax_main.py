@@ -254,6 +254,11 @@ KNOWN_CHATS: dict[int, dict[str, Any]] = {}
 
 
 class BridgeMaxClient(MaxClient):
+    # MAX closes the WebSocket when the request sequence grows past the
+    # positive signed 16-bit range.  PyMax 1.x never wraps this counter, so a
+    # long-running bridge eventually gets stuck reconnecting with seq > 32767.
+    MAX_WEBSOCKET_SEQUENCE = 0x7FFF
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.last_session_alert: float = 0.0
@@ -270,10 +275,23 @@ class BridgeMaxClient(MaxClient):
         except Exception:
             logger.exception("PyMax не смог обработать входящее MAX-сообщение: %r", data)
 
+    def _make_message(
+        self,
+        opcode: Opcode,
+        payload: dict[str, Any],
+        cmd: int = 0,
+    ) -> dict[str, Any]:
+        if self._seq >= self.MAX_WEBSOCKET_SEQUENCE:
+            logger.info("MAX WebSocket sequence reached %s; wrapping to 1", self._seq)
+            self._seq = 0
+        return super()._make_message(opcode, payload, cmd)
+
     async def connect(self, user_agent: UserAgentPayload | None = None) -> dict[str, Any] | None:
         retry_delay = 1.0
         while not self._stop_event.is_set():
             try:
+                # Sequence numbers are scoped to a WebSocket connection.
+                self._seq = 0
                 return await super().connect(user_agent)
             except Exception as e:
                 logger.warning(
